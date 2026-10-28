@@ -1,0 +1,29 @@
+# goflow2 mapping for the fields exported by ipfixprobe (CESNET, PEN 8057),
+# used by the pcapstdin segment. Destinations name EnrichedFlow fields.
+ipfix:
+  mapping:
+    # QUIC plugin
+    - {penprovided: true, pen: 8057, field: 890, destination: QuicSni, endianness: big}
+    - {penprovided: true, pen: 8057, field: 887, destination: QuicSrvPort, endianness: big}
+    - {penprovided: true, pen: 8057, field: 896, destination: QuicOscid, endianness: big}
+    - {penprovided: true, pen: 8057, field: 897, destination: QuicScid, endianness: big}
+    - {penprovided: true, pen: 8057, field: 892, destination: QuicVersion, endianness: big}
+    - {penprovided: true, pen: 8057, field: 893, destination: QuicClientVersion, endianness: big}
+    - {penprovided: true, pen: 8057, field: 894, destination: QuicTokenLength, endianness: big}
+    - {penprovided: true, pen: 8057, field: 899, destination: QuicMultiplexed, endianness: big}
+    - {penprovided: true, pen: 8057, field: 889, destination: QuicZeroRtt, endianness: big}
+    - {penprovided: true, pen: 8057, field: 886, destination: QuicChParsed, endianness: big}
+    - {penprovided: true, pen: 8057, field: 883, destination: QuicTlsExt, endianness: big}
+    - {penprovided: true, pen: 8057, field: 895, destination: QuicOccid, endianness: big}
+    - {penprovided: true, pen: 8057, field: 891, destination: QuicUserAgent, endianness: big}
+    - {penprovided: true, pen: 8057, field: 898, destination: QuicRetryScid, endianness: big}
+    # RFC 6313 basicList wrapper, expanded according to 'basiclists' below
+    - {field: 291, destination: RawBasicList, endianness: big}
+    # RFC 5103 biflow reverse counters
+    - {penprovided: true, pen: 29305, field: 1, destination: BytesRev, endianness: big}
+    - {penprovided: true, pen: 29305, field: 2, destination: PacketsRev, endianness: big}
+
+basiclists:
+  - {pen: 8057, field: 888, destination: QuicPackets}
+  - {pen: 8057, field: 885, destination: QuicTlsExtType}
+  - {pen: 8057, field: 884, destination: QuicTlsExtLen}

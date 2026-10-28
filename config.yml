@@ -1,0 +1,23 @@
+# Input: pcap of the IPFIX export of ipfixprobe on stdin (see pipeline.sh).
+- segment: pcapstdin
+  config:
+    eofcloses: true
+    # QUIC fields (PEN 8057), basicLists and RFC 5103 reverse counters
+    mappingfile: mapping.yml
+
+# IP addresses as strings (SourceIP/DestinationIP), compare_flows.py needs
+# them for the flow key.
+- segment: addrstrings
+
+# Only the fields compare_flows.py uses. Columns are named after the protobuf
+# fields and renamed in compare_flows.py (normalize_pipeline).
+- segment: parquet
+  config:
+    compression: snappy
+    fields: >-
+      TimeFlowStartNs,TimeFlowEndNs,Proto,
+      SourceIP,DestinationIP,SrcPort,DstPort,
+      Bytes,Packets,BytesRev,PacketsRev,
+      QuicSni,QuicVersion,QuicClientVersion,QuicTokenLength,QuicChParsed,QuicMultiplexed,
+      QuicScid,QuicOccid,QuicOscid,QuicRetryScid,
+      QuicTlsExtType,QuicTlsExtLen,QuicPackets,QuicZeroRtt
