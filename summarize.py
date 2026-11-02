@@ -58,9 +58,12 @@ def main() -> int:
     ap.add_argument("pcap_dir", type=Path)
     ap.add_argument("result_dir", type=Path)
     ap.add_argument("--strict", action="store_true", help="exit 1 on any failure")
+    ap.add_argument("--ignore-check", action="append", default=[],
+                    help="leave this check out of the summary (repeatable)")
     args = ap.parse_args()
 
     df = load(args.pcap_dir, args.result_dir)
+    df = df.filter(~pl.col("check").is_in(args.ignore_check))
     failing = (
         df.filter(pl.col("result") == "failed")
         .group_by("pcap", maintain_order=True)

@@ -238,6 +238,23 @@ def add_quic_packet_flags(df: pl.DataFrame, frame_has_valid_version: pl.Expr) ->
 QUIC_F_RETRY_TOKEN_USED = 0x40  # QUICParser::F_RETRY_TOKEN_USED
 
 
+def split_retry_token_used(df: pl.DataFrame, col: str) -> pl.DataFrame:
+    """
+    Splits a QUIC_PACKETS string ("129,197,128") into the packet types without 0x40
+    (<col>_types) and the positions of 0x40 (<col>_rtu, e.g. "1"). Lets quic_packets be
+    checked independently of the Retry-token-used flag.
+    """
+    flags = pl.col(col).str.split(",").list.eval(pl.element().cast(pl.Int64, strict=False))
+    return df.with_columns(
+        flags.list.eval(pl.element() & ~QUIC_F_RETRY_TOKEN_USED)
+        .list.eval(pl.element().cast(pl.Utf8)).list.join(",")
+        .alias(f"{col}_types"),
+        flags.list.eval(pl.arg_where((pl.element() & QUIC_F_RETRY_TOKEN_USED) != 0))
+        .list.eval(pl.element().cast(pl.Utf8)).list.join(",")
+        .alias(f"{col}_rtu"),
+    )
+
+
 def add_retry_token_used(
     df: pl.DataFrame, frame_is_retry: pl.Expr, frame_is_client_initial: pl.Expr
 ) -> pl.DataFrame:
@@ -415,6 +432,16 @@ def aggregate_flows(df: pl.DataFrame) -> pl.DataFrame:
         .alias("quic_token_length_final")
     )
 
+    client_initial_any = first_is_initial & from_client
+    occid = (
+        pl.when(client_initial_any.any())
+        .then(
+            pl.col("quic.scid").filter(client_initial_any)
+            .first().list.get(0, null_on_oob=True).fill_null("")
+        )
+        .alias("quic_occid")
+    )
+
     flows = (
         df.group_by("flow_key", maintain_order=True)
         .agg([
@@ -458,6 +485,7 @@ def aggregate_flows(df: pl.DataFrame) -> pl.DataFrame:
             pl.col("quic.dcid").drop_nulls().explode().drop_nulls().unique(maintain_order=True).alias("quic_dcids_seen"),
             pl.col("quic.scid").drop_nulls().explode().drop_nulls().unique(maintain_order=True).alias("quic_scids_seen"),
             pl.col("quic.odcid").drop_nulls().explode().drop_nulls().unique(maintain_order=True).alias("quic_odcids_seen"),
+            occid,
             retry_scid,
             retry_scids,
             quic_packets,
@@ -513,7 +541,7 @@ def failed_report(failed: pl.DataFrame, *cols) -> dict:
 # Checks that tshark can only get right with the TLS secrets: without them it cannot decrypt
 # the server's transport parameters, misses grease_quic_bit (RFC 9287) and treats coalesced
 # packets with a greased fixed bit as padding.
-NEEDS_SECRETS = {"quic_packets", "quic_zero_rtt"}
+NEEDS_SECRETS = {"quic_packets", "quic_retry_token_used", "quic_zero_rtt"}
 
 
 def has_decryption_secrets(path: Path) -> bool:
@@ -571,14 +599,16 @@ def test_dataframe_time(df: pl.DataFrame, col_ipfix, col_tshark, threshold=0):
         return failed_report(failed, col_ipfix, col_tshark)
 
 
-def test_dataframe_str_isin(df: pl.DataFrame, col_ipfix, col_tshark, place=-1):
-    relevant = df.filter(
-        pl.col(col_ipfix).is_not_null() & (pl.col(col_ipfix) != "")
-    )
+def test_dataframe_str_isin(df: pl.DataFrame, col_ipfix, col_tshark, place=-1, empty_is_error=False):
+    missing = pl.col(col_ipfix).is_null() | (pl.col(col_ipfix) == "")
+    # With required_with_ch an empty value is only fine if tshark saw no ClientHello either
+    tshark_has_ch = pl.col("tshark_tls_handshake_types").list.contains(1).fill_null(False)
+    relevant = df.filter(~missing | (tshark_has_ch if empty_is_error else False))
     if place == -1:
-        failed = relevant.filter(~pl.col(col_tshark).list.contains(pl.col(col_ipfix)))
+        mismatch = ~pl.col(col_tshark).list.contains(pl.col(col_ipfix))
     else:
-        failed = relevant.filter(~pl.col(col_tshark).list.get(place, null_on_oob=True).eq(pl.col(col_ipfix)))
+        mismatch = ~pl.col(col_tshark).list.get(place, null_on_oob=True).eq(pl.col(col_ipfix))
+    failed = relevant.filter(missing | mismatch)
     if failed.is_empty():
         return {"result": "passed"}
     else:
@@ -589,11 +619,12 @@ def test_dataframe_int_isin(df: pl.DataFrame, col_ipfix, col_tshark, drop_number
     if drop_number_null:
         relevant = relevant.with_columns(pl.col(col_ipfix).replace(0, None))
 
-    relevant = relevant.filter(
-        pl.col(col_ipfix).is_not_null()
-    )
+    missing = pl.col(col_ipfix).is_null()
+    # A missing value is only fine if tshark saw no ClientHello either
+    tshark_has_ch = pl.col("tshark_tls_handshake_types").list.contains(1).fill_null(False)
+    relevant = relevant.filter(~missing | tshark_has_ch)
 
-    failed = relevant.filter(~pl.col(col_tshark).list.contains(pl.col(col_ipfix)))
+    failed = relevant.filter(missing | ~pl.col(col_tshark).list.contains(pl.col(col_ipfix)))
 
     if failed.is_empty():
         return {"result": "passed"}
@@ -619,10 +650,11 @@ def test_dataframe_integer_null_as_zero(df: pl.DataFrame, col_ipfix, col_tshark)
 
 
 def test_dataframe_lists(df: pl.DataFrame, col_ipfix, col_tshark):
-    relevant = df.filter(
-        pl.col(col_ipfix).is_not_null() & (pl.col(col_ipfix) != "")
-    )
-    failed = relevant.filter(~pl.col(col_tshark).list.contains(pl.col(col_ipfix)))
+    missing = pl.col(col_ipfix).is_null() | (pl.col(col_ipfix) == "")
+    # An empty value is only fine if tshark saw no ClientHello either
+    tshark_has_ch = pl.col("tshark_tls_handshake_types").list.contains(1).fill_null(False)
+    relevant = df.filter(~missing | tshark_has_ch)
+    failed = relevant.filter(missing | ~pl.col(col_tshark).list.contains(pl.col(col_ipfix)))
     if failed.is_empty():
         return {"result": "passed"}
     else:
@@ -641,7 +673,7 @@ def test_token_length(df: pl.DataFrame, col_ipfix, col_tshark_set):
     )
     if failed.is_empty():
         return {"result": "passed"}
-    return failed_report(failed, col_ipfix, col_tshark)
+    return failed_report(failed, col_ipfix, col_tshark_set)
 
 
 def test_multiplexed(df: pl.DataFrame, col_ipfix, col_tshark):
@@ -725,6 +757,8 @@ def main():
     df_tshark = prefix_columns(flows_tshark, "tshark", ["flow_key"])
 
     joined = df_pipeline.join(df_tshark, on="flow_key", suffix="_ref", how="inner")
+    joined = split_retry_token_used(joined, "ipfixprobe_quic_packets")
+    joined = split_retry_token_used(joined, "tshark_quic_packets")
     THRESHOLD_TIME_NS = 1000
     results = {
         "start_times": test_dataframe_time(joined, "ipfixprobe_time_flow_start_ns", "tshark_t_start", 1000),
@@ -732,9 +766,11 @@ def main():
         "packet_counts": test_dataframe(joined, "ipfixprobe_packets_count", "tshark_packet_count"),
         "total_bytes": test_dataframe(joined, "ipfixprobe_bytes_total", "tshark_bytes_total"),
         "quic_sni": test_dataframe(joined, "ipfixprobe_quic_sni", "tshark_quic_sni"),
-        "quic_occid": test_dataframe_str_isin(joined, "ipfixprobe_quic_occid", "tshark_quic_scids_seen", 0),
+        "quic_occid": test_dataframe(
+            joined.with_columns(pl.col("ipfixprobe_quic_occid").fill_null("")),
+            "ipfixprobe_quic_occid", "tshark_quic_occid"),
         "quic_scid": test_dataframe_str_isin(joined, "ipfixprobe_quic_scid", "tshark_quic_scids_seen"),
-        "quic_oscid": test_dataframe_str_isin(joined, "ipfixprobe_quic_oscid", "tshark_quic_dcids_seen", 0),
+        "quic_oscid": test_dataframe_str_isin(joined, "ipfixprobe_quic_oscid", "tshark_quic_dcids_seen", 0, empty_is_error=True),
         "quic_version": test_dataframe_integer(joined, "ipfixprobe_quic_version", "tshark_quic_version"),
         "quic_client_version": test_dataframe_integer_null_as_zero(joined, "ipfixprobe_quic_client_version", "tshark_quic_client_version"),
         "quic_zero_rtt": test_dataframe_integer_null_as_zero(joined, "ipfixprobe_quic_zero_rtt", "tshark_quic_zero_rtt"),
@@ -744,7 +780,8 @@ def main():
         "quic_ch_parsed": test_dataframe_int_isin(joined, "ipfixprobe_quic_ch_parsed", "tshark_tls_handshake_types", drop_number_null=True),
         "quic_retry_scid": test_dataframe(joined, "ipfixprobe_quic_retry_scid", "tshark_quic_retry_scid", 0),
         "quic_multiplexed": test_multiplexed(joined, "ipfixprobe_quic_multiplexed", "tshark_quic_multiplexed"),
-        "quic_packets": test_dataframe(joined, "ipfixprobe_quic_packets", "tshark_quic_packets"),
+        "quic_packets": test_dataframe(joined, "ipfixprobe_quic_packets_types", "tshark_quic_packets_types"),
+        "quic_retry_token_used": test_dataframe(joined, "ipfixprobe_quic_packets_rtu", "tshark_quic_packets_rtu"),
     }
     if args.pcap and not has_decryption_secrets(Path(args.pcap)):
         results = skip_without_secrets(results, Path(args.pcap))
